@@ -15,13 +15,13 @@ import shutil
 
 PATCH_IMPORT = """
 # ── SLOT patch ──
-import os as _os
-_SLOT_ENABLED = int(_os.environ.get("CHOT_STEPS", "0")) > 0
+# (import placeholder, actual check is at call time)
 # ── end SLOT patch ──
 """
 
 PATCH_HOOK = """        # ── SLOT: apply delta before sampling ──
-        if _SLOT_ENABLED and self.execute_model_state is not None:
+        import os as _os
+        if int(_os.environ.get("CHOT_STEPS", "0")) > 0 and self.execute_model_state is not None:
             from vllm.v1.worker.gpu.slot_patch import slot_optimize_hidden_states
             self.execute_model_state = slot_optimize_hidden_states(self)
         # ── end SLOT ──
