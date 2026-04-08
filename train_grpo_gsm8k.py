@@ -89,7 +89,7 @@ training_args = GRPOConfig(
 
     # vLLM generation backend
     use_vllm=True,
-    vllm_gpu_utilization=0.3,
+    vllm_gpu_memory_utilization=0.3,
 
     # Logging
     logging_steps=1,
