@@ -77,7 +77,6 @@ training_args = GRPOConfig(
     # GRPO
     num_generations=8,
     max_completion_length=1024,
-    max_prompt_length=512,
 
     # Training
     per_device_train_batch_size=8,
