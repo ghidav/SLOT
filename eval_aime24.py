@@ -45,7 +45,7 @@ def main():
     parser.add_argument("--lr", type=float, default=0.1, help="SLOT learning rate")
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "lbfgs"])
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max_tokens", type=int, default=32768)
+    parser.add_argument("--max_tokens", type=int, default=2048)
     args = parser.parse_args()
 
     # Set SLOT env vars
@@ -64,8 +64,7 @@ def main():
     print(f"Model: {args.model_path}")
     print(f"SLOT: steps={args.times}, lr={args.lr}, optimizer={args.optimizer}")
 
-    llm = LLM(model=args.model_path, dtype="bfloat16", gpu_memory_utilization=0.9,
-              max_model_len=args.max_tokens + 512)
+    llm = LLM(model=args.model_path, dtype="bfloat16", gpu_memory_utilization=0.9)
     sampling_params = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens)
 
     outputs = llm.generate(prompts, sampling_params)
