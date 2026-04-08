@@ -72,9 +72,8 @@ def install(vllm_dir):
 
     # Insert hook at the start of sample_tokens, after unpacking execute_model_state
     patched = "\n".join(lines)
-    # Find "def sample_tokens" and inject after the None check
+    # Find "def sample_tokens" and inject BEFORE the None assignment
     marker = "self.execute_model_state = None"
-    # Find the first occurrence in sample_tokens
     st_idx = patched.find("def sample_tokens")
     if st_idx == -1:
         print("ERROR: Could not find sample_tokens method")
@@ -83,9 +82,9 @@ def install(vllm_dir):
     if marker_idx == -1:
         print("ERROR: Could not find execute_model_state = None in sample_tokens")
         return
-    # Insert after that line
-    end_of_line = patched.index("\n", marker_idx)
-    patched = patched[:end_of_line + 1] + PATCH_HOOK + patched[end_of_line + 1:]
+    # Find the start of the line containing the marker
+    line_start = patched.rfind("\n", 0, marker_idx) + 1
+    patched = patched[:line_start] + PATCH_HOOK + patched[line_start:]
 
     with open(mr_path, "w") as f:
         f.write(patched)
