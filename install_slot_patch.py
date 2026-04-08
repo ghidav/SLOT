@@ -22,8 +22,11 @@ PATCH_IMPORT = """
 PATCH_HOOK = """        # ── SLOT: apply delta before sampling ──
         import os as _os
         if int(_os.environ.get("CHOT_STEPS", "0")) > 0 and self.execute_model_state is not None:
-            from vllm.v1.worker.gpu.slot_patch import slot_optimize_hidden_states
-            self.execute_model_state = slot_optimize_hidden_states(self)
+            try:
+                from vllm.v1.worker.gpu.slot_patch import slot_optimize_hidden_states
+                self.execute_model_state = slot_optimize_hidden_states(self)
+            except Exception as _e:
+                import traceback; traceback.print_exc()
         # ── end SLOT ──
 """
 
