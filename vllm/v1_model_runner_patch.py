@@ -184,6 +184,7 @@ def slot_optimize_hidden_states(model_runner):
     chot_lr = float(os.environ.get("CHOT_LR", "0.1"))
     chot_optimizer = os.environ.get("CHOT_OPTIMIZER", "adamw")
     tp_size = int(os.environ.get("tensor_parallel_size_my", "1"))
+    print(f"[SLOT] called: steps={chot_steps}, lr={chot_lr}, opt={chot_optimizer}", flush=True)
 
     (
         input_batch,
