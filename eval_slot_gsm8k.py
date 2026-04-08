@@ -23,20 +23,18 @@ from datasets import load_dataset
 from math_verify import ExprExtractionConfig, parse, verify
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-SYSTEM_PROMPT = (
-    "You are a helpful assistant. A conversation between User and Assistant. "
-    "The user asks a question, and the Assistant solves it. The Assistant first "
-    "thinks about the reasoning process in the mind and then provides the user "
-    "with the answer. The reasoning process and answer are enclosed within "
-    "<think> </think> and <answer> </answer> tags, respectively, i.e., "
-    "<think> reasoning process here </think><answer> answer here </answer>."
+PROMPT_TEMPLATE = (
+    "Question: {question}\n"
+    "Please think step by step and provide your answer.\n"
+    "<think>"
 )
 
 
 # ──────────────────────── Reward helpers ────────────────────────
 
 def check_format(text):
-    return bool(re.match(r"^<think>.*?</think><answer>.*?</answer>$", text, re.DOTALL))
+    # Prompt already includes "<think>", so completion starts inside the think block
+    return bool(re.match(r"^.*?</think><answer>.*?</answer>$", text, re.DOTALL))
 
 
 def check_correct(text, ground_truth):
@@ -130,12 +128,8 @@ def evaluate(model, tokenizer, args):
     gen_kwargs = dict(do_sample=False, max_new_tokens=1024)
 
     for i, qa in enumerate(qa_pairs):
-        prompt_text = tokenizer.apply_chat_template(
-            [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": qa["Q"]}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        inputs = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False).to(model.device)
+        prompt_text = PROMPT_TEMPLATE.format(question=qa["Q"])
+        inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
         input_ids = inputs["input_ids"]
 
         # SLOT optimisation

@@ -14,25 +14,19 @@ from trl import GRPOConfig, GRPOTrainer
 
 # ──────────────────────────── Config ────────────────────────────
 
-MODEL_NAME = "Qwen/Qwen3-0.6B"
+MODEL_NAME = "Qwen/Qwen3-0.6B-Base"
 
-SYSTEM_PROMPT = (
-    "You are a helpful assistant. A conversation between User and Assistant. "
-    "The user asks a question, and the Assistant solves it. The Assistant first "
-    "thinks about the reasoning process in the mind and then provides the user "
-    "with the answer. The reasoning process and answer are enclosed within "
-    "<think> </think> and <answer> </answer> tags, respectively, i.e., "
-    "<think> reasoning process here </think><answer> answer here </answer>."
+PROMPT_TEMPLATE = (
+    "Question: {question}\n"
+    "Please think step by step and provide your answer.\n"
+    "<think>"
 )
 
 # ──────────────────────────── Dataset ───────────────────────────
 
 def build_prompt(example):
     return {
-        "prompt": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": example["question"]},
-        ]
+        "prompt": PROMPT_TEMPLATE.format(question=example["question"]),
     }
 
 
@@ -47,8 +41,8 @@ dataset = dataset.map(build_prompt)
 # ──────────────────────────── Rewards ───────────────────────────
 
 def reward_format(completions, **kwargs):
-    """Reward for using the correct <think>...</think><answer>...</answer> format."""
-    pattern = re.compile(r"^<think>.*?</think><answer>.*?</answer>$", re.DOTALL)
+    """Reward for correct format. Prompt includes '<think>', so completion continues from there."""
+    pattern = re.compile(r"^.*?</think><answer>.*?</answer>$", re.DOTALL)
     return [1.0 if pattern.match(c) else 0.0 for c in completions]
 
 
