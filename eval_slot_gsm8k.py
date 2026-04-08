@@ -58,7 +58,7 @@ def get_prompt_hidden_states(model, input_ids):
     return outputs[0]  # (batch, seq, hidden)
 
 
-def slot_optimize(model, input_ids, times, lr):
+def slot_optimize(model, input_ids, times, lr, optimizer_type="adamw"):
     """
     Learn an additive delta on the hidden states that minimises next-token
     prediction loss on the prompt itself (self-supervised at test time).
@@ -67,16 +67,30 @@ def slot_optimize(model, input_ids, times, lr):
     hidden = get_prompt_hidden_states(model, input_ids).detach()
 
     delta = nn.Parameter(torch.zeros(1, 1, hidden.shape[-1], device=hidden.device, dtype=hidden.dtype))
-    optimizer = torch.optim.AdamW([delta], lr=lr, weight_decay=1e-8, eps=1e-5)
 
-    for _ in range(times):
-        optimizer.zero_grad()
+    def compute_loss():
         logits = model.lm_head(hidden + delta)
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = input_ids[:, 1:].contiguous()
-        loss = nn.CrossEntropyLoss()(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        loss.backward()
-        optimizer.step()
+        return nn.CrossEntropyLoss()(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+    if optimizer_type == "lbfgs":
+        optimizer = torch.optim.LBFGS([delta], lr=lr, max_iter=times, line_search_fn="strong_wolfe")
+
+        def closure():
+            optimizer.zero_grad()
+            loss = compute_loss()
+            loss.backward()
+            return loss
+
+        optimizer.step(closure)
+    else:
+        optimizer = torch.optim.AdamW([delta], lr=lr, weight_decay=1e-8, eps=1e-5)
+        for _ in range(times):
+            optimizer.zero_grad()
+            loss = compute_loss()
+            loss.backward()
+            optimizer.step()
 
     return delta.detach()
 
@@ -126,7 +140,7 @@ def evaluate(model, tokenizer, args):
         hook = None
         if args.times > 0:
             with torch.enable_grad():
-                delta = slot_optimize(model, input_ids, args.times, args.lr)
+                delta = slot_optimize(model, input_ids, args.times, args.lr, args.optimizer)
             hook = SlotHook(model, delta)
 
         # Generate
@@ -153,6 +167,7 @@ def main():
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--times", type=int, default=5, help="SLOT optimisation steps (0 = baseline)")
     parser.add_argument("--lr", type=float, default=0.1, help="SLOT learning rate")
+    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "lbfgs"], help="SLOT optimizer")
     parser.add_argument("--eval_samples", type=int, default=None)
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--seed", type=int, default=42)
