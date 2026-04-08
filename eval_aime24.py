@@ -70,7 +70,8 @@ def main():
     print(f"Model: {args.model_path}")
     print(f"SLOT: steps={args.times}, lr={args.lr}, optimizer={args.optimizer}")
 
-    llm = LLM(model=args.model_path, dtype="bfloat16", gpu_memory_utilization=0.9)
+    llm = LLM(model=args.model_path, dtype="bfloat16", gpu_memory_utilization=0.9,
+              enforce_eager=True if args.times > 0 else False)
     sampling_params = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens)
 
     outputs = llm.generate(prompts, sampling_params)

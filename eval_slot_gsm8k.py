@@ -77,7 +77,8 @@ def main():
 
     print(f"Evaluating {len(qa_pairs)} samples, CHOT_STEPS={args.times}, CHOT_LR={args.lr}")
 
-    llm = LLM(model=args.model_path, dtype="bfloat16", gpu_memory_utilization=0.9)
+    llm = LLM(model=args.model_path, dtype="bfloat16", gpu_memory_utilization=0.9,
+              enforce_eager=True if args.times > 0 else False)
     sampling_params = SamplingParams(temperature=0, max_tokens=2048)
 
     outputs = llm.generate(prompts, sampling_params)
