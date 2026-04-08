@@ -87,8 +87,9 @@ training_args = GRPOConfig(
     per_device_train_batch_size=4,
     gradient_accumulation_steps=8,
     num_train_epochs=1,
-    learning_rate=5e-6,
-    warmup_ratio=0.05,
+    learning_rate=2e-6,
+    lr_scheduler_type="constant",
+    warmup_ratio=0.0,
     bf16=True,
 
     # vLLM generation backend
