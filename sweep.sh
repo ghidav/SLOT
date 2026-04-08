@@ -4,6 +4,11 @@ set -e
 MODEL_PATH=${1:-"outputs/grpo_qwen3_0.6b_gsm8k"}
 LR=${2:-0.1}
 
+# Install SLOT-patched model_runner into vLLM
+VLLM_WORKER_DIR=$(python -c "import vllm, os; print(os.path.join(os.path.dirname(vllm.__file__), 'worker'))")
+cp ./vllm/model_runner.py "$VLLM_WORKER_DIR/"
+echo "Installed patched model_runner.py into $VLLM_WORKER_DIR"
+
 echo "=== Baseline ==="
 python eval_slot_gsm8k.py --model_path "$MODEL_PATH" --times 0
 

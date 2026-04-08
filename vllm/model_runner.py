@@ -1819,92 +1819,148 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         if model_input.is_prompt:
             chot_steps = int(os.environ.get("CHOT_STEPS", "5"))
             chot_lr = float(os.environ.get("CHOT_LR", "0.1"))
+            chot_optimizer = os.environ.get("CHOT_OPTIMIZER", "adamw")
 
             self.ptuning_params = torch.zeros(
                 self.model.lm_head.embedding_dim,
                 device=hidden_or_intermediate_states.device,
                 dtype=hidden_or_intermediate_states.dtype)
 
-            self.adam_m = torch.zeros_like(self.ptuning_params)
-            self.adam_v = torch.zeros_like(self.ptuning_params)
-            beta1, beta2, eps = 0.9, 0.95, 1e-6
-            adam_step = 0
-            weight_decay = 1e-5
+            # Shared helpers for manual forward/backward
+            lm_head_weight = self.custom_head_weights
+            target_tokens = model_input.input_tokens
 
-            for _ in range(chot_steps):
-                hidden_states_orig = hidden_or_intermediate_states.clone()
-                hidden_states_cur = hidden_states_orig + self.ptuning_params
-                
-                lm_head_weight = self.custom_head_weights
-                temp_logits = hidden_states_cur @ lm_head_weight.T
+            def _compute_loss_and_grad(params):
+                """Manual forward + backward. Returns (loss, gradient)."""
+                h = hidden_or_intermediate_states + params
+                logits = h @ lm_head_weight.T
 
-                target_tokens = model_input.input_tokens
-
-                # Only handles len(temp_logits.shape) == 2 case
-                shift_logits = temp_logits[:-1, :].contiguous()
+                shift_logits = logits[:-1, :].contiguous()
                 shift_labels = target_tokens[1:].contiguous()
-                vocab_size = shift_logits.size(1)
 
                 # Softmax
-                max_logits = torch.max(shift_logits, dim=-1, keepdim=True)[0]
-                exp_logits = torch.exp(shift_logits - max_logits)
-                sum_exp_logits = torch.sum(exp_logits, dim=-1, keepdim=True)
-                probs = exp_logits / sum_exp_logits
-                del max_logits, exp_logits, sum_exp_logits
+                max_l = torch.max(shift_logits, dim=-1, keepdim=True)[0]
+                exp_l = torch.exp(shift_logits - max_l)
+                probs = exp_l / torch.sum(exp_l, dim=-1, keepdim=True)
+                del max_l, exp_l
 
-                # Flatten (already flat for 2D)
-                flat_probs = probs
                 flat_labels = shift_labels
-
-                valid_label_mask = (flat_labels >= 0).float()
-
-                # Loss calculation
-                batch_indices = torch.arange(flat_labels.size(0),
-                                                device=flat_labels.device)
+                valid_mask = (flat_labels >= 0).float()
                 valid_labels = torch.clamp(flat_labels, min=0)
-                masked_probs = flat_probs[batch_indices,
-                                            valid_labels] * valid_label_mask
-                log_probs = torch.log(masked_probs + 1e-10)
-                num_valid = torch.sum(valid_label_mask)
-                loss = -torch.sum(log_probs) / (num_valid + 1e-10)
-                del batch_indices, valid_labels, masked_probs, log_probs, num_valid
 
-                # Gradient calculation
-                one_hot = torch.zeros_like(flat_probs)
-                valid_labels = torch.clamp(flat_labels, min=0)
-                valid_label_mask_cast = valid_label_mask.to(
-                    dtype=one_hot.dtype)
+                # Loss: -mean(log(p[y]))
+                idx = torch.arange(flat_labels.size(0), device=flat_labels.device)
+                masked_p = probs[idx, valid_labels] * valid_mask
+                n_valid = torch.sum(valid_mask)
+                loss = -torch.sum(torch.log(masked_p + 1e-10)) / (n_valid + 1e-10)
+                del idx, masked_p
+
+                # Gradient of CE+softmax: (p - one_hot) / n_valid
+                one_hot = torch.zeros_like(probs)
                 one_hot.scatter_(1, valid_labels.unsqueeze(1),
-                                    valid_label_mask_cast.unsqueeze(1))
-
-                d_logits_grad = probs - one_hot
-                d_logits_grad = d_logits_grad / (torch.sum(valid_label_mask)
-                                                    + 1e-10)
+                                 valid_mask.to(dtype=one_hot.dtype).unsqueeze(1))
+                d_logits = (probs - one_hot) / (n_valid + 1e-10)
                 del one_hot, probs
 
-                # Backpropagation
-                d_hidden = torch.matmul(d_logits_grad, lm_head_weight)
-                del d_logits_grad, temp_logits
+                # Backprop through lm_head: d_hidden = d_logits @ W
+                d_hidden = torch.matmul(d_logits, lm_head_weight)
+                grad = d_hidden.mean(dim=0)
+                del d_logits, d_hidden
 
-                # Aggregate gradient
-                d_ptuning = d_hidden.mean(dim=0)
-                del d_hidden, hidden_states_orig
+                return loss, grad
 
-                # Adam update
-                adam_step += 1
-                bias_correction1 = 1 - beta1**adam_step
-                bias_correction2 = 1 - beta2**adam_step
+            if chot_optimizer == "lbfgs":
+                # ── L-BFGS with manual two-loop recursion ──
+                m = min(chot_steps, 10)  # history size (capped)
+                s_hist = []  # s_k = x_{k+1} - x_k
+                y_hist = []  # y_k = g_{k+1} - g_k
+                rho_hist = []  # 1 / (y_k^T s_k)
+                c1 = 1e-4  # Armijo constant
+                max_ls = 10  # max line search evals
 
-                self.adam_m = beta1 * self.adam_m + (1 - beta1) * d_ptuning
-                self.adam_v = beta2 * self.adam_v + (1 -
-                                                        beta2) * (d_ptuning**2)
+                prev_grad = None
+                for k in range(chot_steps):
+                    loss, grad = _compute_loss_and_grad(self.ptuning_params)
 
-                m_hat = self.adam_m / bias_correction1
-                v_hat = self.adam_v / bias_correction2
+                    # Two-loop recursion to get search direction
+                    q = grad.clone().float()
+                    n_hist = len(s_hist)
+                    alphas = [None] * n_hist
 
-                update = chot_lr * m_hat / (torch.sqrt(v_hat) + eps)
-                self.ptuning_params = self.ptuning_params - update - chot_lr * weight_decay * self.ptuning_params
-                del d_ptuning
+                    # Backward loop
+                    for i in range(n_hist - 1, -1, -1):
+                        alphas[i] = rho_hist[i] * torch.dot(s_hist[i], q)
+                        q = q - alphas[i] * y_hist[i]
+
+                    # Initial Hessian approximation H_0 = gamma * I
+                    if n_hist > 0:
+                        gamma = torch.dot(y_hist[-1], s_hist[-1]) / (torch.dot(y_hist[-1], y_hist[-1]) + 1e-10)
+                        r = gamma * q
+                    else:
+                        r = q
+
+                    # Forward loop
+                    for i in range(n_hist):
+                        beta = rho_hist[i] * torch.dot(y_hist[i], r)
+                        r = r + s_hist[i] * (alphas[i] - beta)
+
+                    direction = -r.to(self.ptuning_params.dtype)
+
+                    # Backtracking line search (Armijo condition)
+                    step_size = chot_lr
+                    dir_dot_grad = torch.dot(direction.float(), grad.float())
+                    if dir_dot_grad >= 0:
+                        # Not a descent direction, fall back to steepest descent
+                        direction = -grad
+                        dir_dot_grad = -torch.dot(grad.float(), grad.float())
+
+                    for _ in range(max_ls):
+                        new_params = self.ptuning_params + step_size * direction
+                        new_loss, _ = _compute_loss_and_grad(new_params)
+                        if new_loss <= loss + c1 * step_size * dir_dot_grad:
+                            break
+                        step_size *= 0.5
+                    else:
+                        new_params = self.ptuning_params + step_size * direction
+
+                    # Update history
+                    s_k = (step_size * direction).float()
+                    if prev_grad is not None:
+                        y_k = (grad - prev_grad).float()
+                        ys = torch.dot(y_k, s_k)
+                        if ys > 1e-10:  # curvature condition
+                            if len(s_hist) >= m:
+                                s_hist.pop(0)
+                                y_hist.pop(0)
+                                rho_hist.pop(0)
+                            s_hist.append(s_k)
+                            y_hist.append(y_k)
+                            rho_hist.append(1.0 / ys)
+
+                    prev_grad = grad.float()
+                    self.ptuning_params = new_params
+
+            else:
+                # ── AdamW (original) ──
+                adam_m = torch.zeros_like(self.ptuning_params)
+                adam_v = torch.zeros_like(self.ptuning_params)
+                beta1, beta2, eps = 0.9, 0.95, 1e-6
+                weight_decay = 1e-5
+
+                for step in range(1, chot_steps + 1):
+                    loss, grad = _compute_loss_and_grad(self.ptuning_params)
+
+                    bias_correction1 = 1 - beta1**step
+                    bias_correction2 = 1 - beta2**step
+
+                    adam_m = beta1 * adam_m + (1 - beta1) * grad
+                    adam_v = beta2 * adam_v + (1 - beta2) * (grad**2)
+
+                    m_hat = adam_m / bias_correction1
+                    v_hat = adam_v / bias_correction2
+
+                    update = chot_lr * m_hat / (torch.sqrt(v_hat) + eps)
+                    self.ptuning_params = self.ptuning_params - update - chot_lr * weight_decay * self.ptuning_params
 
         # Apply optimized parameters
         if hasattr(self, 'ptuning_params') and self.ptuning_params is not None:
