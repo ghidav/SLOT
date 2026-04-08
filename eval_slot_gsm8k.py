@@ -12,6 +12,8 @@ Usage:
 """
 
 import argparse
+import json
+import os
 import random
 import re
 
@@ -159,7 +161,27 @@ def evaluate(model, tokenizer, args):
         if (i + 1) % 50 == 0 or (i + 1) == total:
             print(f"[{i+1}/{total}]  acc={correct/(i+1):.3f}  fmt={fmt_correct/(i+1):.3f}")
 
-    print(f"\nFinal  ({total} samples):  accuracy={correct/total:.4f}  format={fmt_correct/total:.4f}")
+    accuracy = correct / total if total > 0 else 0
+    format_acc = fmt_correct / total if total > 0 else 0
+    print(f"\nFinal  ({total} samples):  accuracy={accuracy:.4f}  format={format_acc:.4f}")
+
+    # Save results
+    result = {
+        "model_path": args.model_path,
+        "optimizer": args.optimizer if args.times > 0 else "none",
+        "times": args.times,
+        "lr": args.lr,
+        "split": args.split,
+        "eval_samples": total,
+        "accuracy": accuracy,
+        "format_accuracy": format_acc,
+    }
+    os.makedirs("results", exist_ok=True)
+    tag = f"baseline" if args.times == 0 else f"{args.optimizer}_t{args.times}_lr{args.lr}"
+    results_path = f"results/{tag}.json"
+    with open(results_path, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"Results saved to {results_path}")
 
 
 def main():
