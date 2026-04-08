@@ -1,10 +1,11 @@
 """
-Test-time SLOT optimization + GSM8K evaluation for any causal LM.
+Test-time SLOT optimization + GSM8K evaluation.
 
-Works with the GRPO-trained Qwen3-0.6B (or any HF causal model).
+Baseline (times=0) uses vLLM for fast batched inference.
+SLOT (times>0) uses HF model with per-sample optimization.
 
 Usage:
-  # Baseline (no SLOT):
+  # Baseline (fast, vLLM):
   python eval_slot_gsm8k.py --model_path outputs/grpo_qwen3_0.6b_gsm8k --times 0
 
   # SLOT with 5 iterations:
@@ -21,7 +22,6 @@ import torch
 import torch.nn as nn
 from datasets import load_dataset
 from math_verify import ExprExtractionConfig, parse, verify
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 PROMPT_TEMPLATE = (
     "Question: {question}\n"
@@ -47,21 +47,44 @@ def check_correct(text, ground_truth):
         return False
 
 
+def score_completions(completions, qa_pairs):
+    correct, fmt_correct = 0, 0
+    for comp, qa in zip(completions, qa_pairs):
+        is_fmt = check_format(comp)
+        is_correct = check_correct(comp, qa["A"])
+        fmt_correct += is_fmt
+        correct += is_correct
+    total = len(qa_pairs)
+    accuracy = correct / total if total > 0 else 0
+    format_acc = fmt_correct / total if total > 0 else 0
+    return accuracy, format_acc
+
+
+# ──────────────────── Baseline: vLLM batched ────────────────────
+
+def evaluate_baseline(args, qa_pairs):
+    from vllm import LLM, SamplingParams
+
+    prompts = [PROMPT_TEMPLATE.format(question=qa["Q"]) for qa in qa_pairs]
+
+    llm = LLM(model=args.model_path, dtype="bfloat16", gpu_memory_utilization=0.9)
+    sampling_params = SamplingParams(temperature=0, max_tokens=2048)
+
+    outputs = llm.generate(prompts, sampling_params)
+    completions = [o.outputs[0].text for o in outputs]
+
+    return score_completions(completions, qa_pairs)
+
+
 # ──────────────────── SLOT: test-time delta ─────────────────────
 
 @torch.no_grad()
 def get_prompt_hidden_states(model, input_ids):
-    """Run a forward pass and grab the last hidden states (before lm_head)."""
     outputs = model.model(input_ids=input_ids)
-    return outputs[0]  # (batch, seq, hidden)
+    return outputs[0]
 
 
 def slot_optimize(model, input_ids, times, lr, optimizer_type="adamw"):
-    """
-    Learn an additive delta on the hidden states that minimises next-token
-    prediction loss on the prompt itself (self-supervised at test time).
-    Returns the optimised delta tensor.
-    """
     hidden = get_prompt_hidden_states(model, input_ids).detach()
 
     delta = nn.Parameter(torch.zeros(1, 1, hidden.shape[-1], device=hidden.device, dtype=hidden.dtype))
@@ -94,15 +117,11 @@ def slot_optimize(model, input_ids, times, lr, optimizer_type="adamw"):
 
 
 class SlotHook:
-    """Hooks into the model so that `generate()` uses the optimised delta."""
-
     def __init__(self, model, delta):
         self.delta = delta
-        # Hook right after the transformer body, before lm_head
         self.handle = model.model.register_forward_hook(self._hook)
 
     def _hook(self, module, input, output):
-        # output is BaseModelOutputWithPast; output[0] is hidden_states
         hidden = output[0] + self.delta
         return (hidden,) + output[1:]
 
@@ -110,40 +129,32 @@ class SlotHook:
         self.handle.remove()
 
 
-# ──────────────────────── Evaluation ────────────────────────────
+def evaluate_slot(args, qa_pairs):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
-def evaluate(model, tokenizer, args):
-    dataset = load_dataset("openai/gsm8k", "main", split=args.split)
-    qa_pairs = [
-        {"Q": q, "A": a.split("####")[-1].strip()}
-        for q, a in zip(dataset["question"], dataset["answer"])
-    ]
-    random.seed(args.seed)
-    if args.eval_samples and len(qa_pairs) > args.eval_samples:
-        qa_pairs = random.sample(qa_pairs, args.eval_samples)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path, dtype=torch.bfloat16, attn_implementation="sdpa"
+    ).to("cuda")
+    model.eval()
 
     correct, fmt_correct, total = 0, 0, len(qa_pairs)
-    gen_kwargs = dict(do_sample=False, max_new_tokens=1024)
+    gen_kwargs = dict(do_sample=False, max_new_tokens=2048)
 
     for i, qa in enumerate(qa_pairs):
         prompt_text = PROMPT_TEMPLATE.format(question=qa["Q"])
         inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
         input_ids = inputs["input_ids"]
 
-        # SLOT optimisation
-        hook = None
-        if args.times > 0:
-            with torch.enable_grad():
-                delta = slot_optimize(model, input_ids, args.times, args.lr, args.optimizer)
-            hook = SlotHook(model, delta)
+        with torch.enable_grad():
+            delta = slot_optimize(model, input_ids, args.times, args.lr, args.optimizer)
+        hook = SlotHook(model, delta)
 
-        # Generate
         with torch.no_grad():
             out = model.generate(**inputs, **gen_kwargs)
         completion = tokenizer.decode(out[0][input_ids.shape[1]:], skip_special_tokens=True)
 
-        if hook is not None:
-            hook.remove()
+        hook.remove()
 
         is_fmt = check_format(completion)
         is_correct = check_correct(completion, qa["A"])
@@ -155,7 +166,39 @@ def evaluate(model, tokenizer, args):
 
     accuracy = correct / total if total > 0 else 0
     format_acc = fmt_correct / total if total > 0 else 0
-    print(f"\nFinal  ({total} samples):  accuracy={accuracy:.4f}  format={format_acc:.4f}")
+    return accuracy, format_acc
+
+
+# ──────────────────────── Main ──────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_path", type=str, required=True)
+    parser.add_argument("--times", type=int, default=5, help="SLOT optimisation steps (0 = vLLM baseline)")
+    parser.add_argument("--lr", type=float, default=0.1, help="SLOT learning rate")
+    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "lbfgs"], help="SLOT optimizer")
+    parser.add_argument("--eval_samples", type=int, default=None)
+    parser.add_argument("--split", type=str, default="test")
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    dataset = load_dataset("openai/gsm8k", "main", split=args.split)
+    qa_pairs = [
+        {"Q": q, "A": a.split("####")[-1].strip()}
+        for q, a in zip(dataset["question"], dataset["answer"])
+    ]
+    random.seed(args.seed)
+    if args.eval_samples and len(qa_pairs) > args.eval_samples:
+        qa_pairs = random.sample(qa_pairs, args.eval_samples)
+
+    print(f"Evaluating {len(qa_pairs)} samples, times={args.times}")
+
+    if args.times == 0:
+        accuracy, format_acc = evaluate_baseline(args, qa_pairs)
+    else:
+        accuracy, format_acc = evaluate_slot(args, qa_pairs)
+
+    print(f"\nFinal  ({len(qa_pairs)} samples):  accuracy={accuracy:.4f}  format={format_acc:.4f}")
 
     # Save results
     result = {
@@ -164,36 +207,16 @@ def evaluate(model, tokenizer, args):
         "times": args.times,
         "lr": args.lr,
         "split": args.split,
-        "eval_samples": total,
+        "eval_samples": len(qa_pairs),
         "accuracy": accuracy,
         "format_accuracy": format_acc,
     }
     os.makedirs("results", exist_ok=True)
-    tag = f"baseline" if args.times == 0 else f"{args.optimizer}_t{args.times}_lr{args.lr}"
+    tag = "baseline" if args.times == 0 else f"{args.optimizer}_t{args.times}_lr{args.lr}"
     results_path = f"results/{tag}.json"
     with open(results_path, "w") as f:
         json.dump(result, f, indent=2)
     print(f"Results saved to {results_path}")
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, required=True)
-    parser.add_argument("--times", type=int, default=5, help="SLOT optimisation steps (0 = baseline)")
-    parser.add_argument("--lr", type=float, default=0.1, help="SLOT learning rate")
-    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "lbfgs"], help="SLOT optimizer")
-    parser.add_argument("--eval_samples", type=int, default=None)
-    parser.add_argument("--split", type=str, default="test")
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path, torch_dtype=torch.bfloat16, attn_implementation="sdpa"
-    ).to("cuda")
-    model.eval()
-
-    evaluate(model, tokenizer, args)
 
 
 if __name__ == "__main__":
