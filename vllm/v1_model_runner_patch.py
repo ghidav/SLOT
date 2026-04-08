@@ -202,33 +202,40 @@ def slot_optimize_hidden_states(model_runner):
     lm_head_weight = _get_lm_head_weight(model_runner)
     input_ids = input_batch.input_ids[:input_batch.num_tokens]
     num_scheduled = input_batch.num_scheduled_tokens
+    req_ids = input_batch.req_ids
 
     optimize_fn = _optimize_lbfgs if chot_optimizer == "lbfgs" else _optimize_adamw
+
+    if not hasattr(model_runner, '_slot_deltas'):
+        model_runner._slot_deltas = {}
+
+    # Clean up deltas for finished requests
+    active_req_ids = set(req_ids)
+    for rid in list(model_runner._slot_deltas.keys()):
+        if rid not in active_req_ids:
+            del model_runner._slot_deltas[rid]
 
     offset = 0
     for i in range(len(num_scheduled)):
         n_tokens = int(num_scheduled[i])
+        rid = req_ids[i]
 
         if n_tokens <= 1:
             # Decode — apply cached delta
-            if hasattr(model_runner, '_slot_deltas') and i in model_runner._slot_deltas:
-                hidden_states[offset:offset + n_tokens] += model_runner._slot_deltas[i]
+            if rid in model_runner._slot_deltas:
+                hidden_states[offset:offset + n_tokens] += model_runner._slot_deltas[rid]
             offset += n_tokens
             continue
 
         # Prefill — optimize delta
         req_hidden = hidden_states[offset:offset + n_tokens]
-        req_ids = input_ids[offset:offset + n_tokens]
+        req_input_ids = input_ids[offset:offset + n_tokens]
 
-        delta = optimize_fn(req_hidden, req_ids, lm_head_weight, chot_steps, chot_lr)
+        delta = optimize_fn(req_hidden, req_input_ids, lm_head_weight, chot_steps, chot_lr)
         scaled_delta = delta / tp_size
 
         hidden_states[offset:offset + n_tokens] += scaled_delta
-
-        # Cache for decode phase
-        if not hasattr(model_runner, '_slot_deltas'):
-            model_runner._slot_deltas = {}
-        model_runner._slot_deltas[i] = scaled_delta
+        model_runner._slot_deltas[rid] = scaled_delta
 
         offset += n_tokens
 
