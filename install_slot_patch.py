@@ -16,11 +16,7 @@ import shutil
 PATCH_IMPORT = """
 # ── SLOT patch ──
 import os as _os
-if int(_os.environ.get("CHOT_STEPS", "0")) > 0:
-    from vllm.v1.worker.gpu.slot_patch import apply_slot_patch as _apply_slot
-    _SLOT_ENABLED = True
-else:
-    _SLOT_ENABLED = False
+_SLOT_ENABLED = int(_os.environ.get("CHOT_STEPS", "0")) > 0
 # ── end SLOT patch ──
 """
 
