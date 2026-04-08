@@ -18,8 +18,7 @@ MODEL_NAME = "Qwen/Qwen3-0.6B-Base"
 
 PROMPT_TEMPLATE = (
     "Question: {question}\n"
-    "Please think step by step and provide your answer.\n"
-    "<think>"
+    "Please think step by step and put your final answer in \\boxed{{}}.\n"
 )
 
 # ──────────────────────────── Dataset ───────────────────────────
@@ -35,29 +34,34 @@ def extract_answer(text):
     return text.split("####")[-1].strip()
 
 
+def extract_boxed(text):
+    """Extract content from \\boxed{...}."""
+    match = re.search(r"\\boxed\{([^}]*)\}", text)
+    return match.group(1).strip() if match else None
+
+
 dataset = load_dataset("openai/gsm8k", "main", split="train")
 dataset = dataset.map(build_prompt)
 
 # ──────────────────────────── Rewards ───────────────────────────
 
 def reward_format(completions, **kwargs):
-    """Reward for correct format. Prompt includes '<think>', so completion continues from there."""
-    pattern = re.compile(r"^.*?</think><answer>.*?</answer>$", re.DOTALL)
-    return [1.0 if pattern.match(c) else 0.0 for c in completions]
+    """Reward for containing a \\boxed{} answer."""
+    pattern = re.compile(r"\\boxed\{[^}]+\}")
+    return [1.0 if pattern.search(c) else 0.0 for c in completions]
 
 
 def reward_correctness(completions, answer, **kwargs):
-    """Reward for producing the correct numerical answer."""
+    """Reward for producing the correct numerical answer in \\boxed{}."""
     scores = []
     for completion, gt in zip(completions, answer):
         gt_value = extract_answer(gt)
-        # Pull last number from completion
-        nums = re.findall(r"\d+\.\d+|\d+/\d+|\d+", completion)
-        if not nums:
+        boxed = extract_boxed(completion)
+        if boxed is None:
             scores.append(0.0)
             continue
         try:
-            parsed_answer = parse(nums[-1], extraction_config=[ExprExtractionConfig()])
+            parsed_answer = parse(boxed, extraction_config=[ExprExtractionConfig()])
             parsed_gt = parse(gt_value, extraction_config=[ExprExtractionConfig()])
             if parsed_answer is not None and parsed_gt is not None and verify(parsed_answer, parsed_gt):
                 scores.append(1.0)

@@ -25,24 +25,22 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 PROMPT_TEMPLATE = (
     "Question: {question}\n"
-    "Please think step by step and provide your answer.\n"
-    "<think>"
+    "Please think step by step and put your final answer in \\boxed{{}}.\n"
 )
 
 
 # ──────────────────────── Reward helpers ────────────────────────
 
 def check_format(text):
-    # Prompt already includes "<think>", so completion starts inside the think block
-    return bool(re.match(r"^.*?</think><answer>.*?</answer>$", text, re.DOTALL))
+    return bool(re.search(r"\\boxed\{[^}]+\}", text))
 
 
 def check_correct(text, ground_truth):
-    nums = re.findall(r"\d+\.\d+|\d+/\d+|\d+", text)
-    if not nums:
+    match = re.search(r"\\boxed\{([^}]*)\}", text)
+    if not match:
         return False
     try:
-        a = parse(nums[-1], extraction_config=[ExprExtractionConfig()])
+        a = parse(match.group(1).strip(), extraction_config=[ExprExtractionConfig()])
         b = parse(ground_truth, extraction_config=[ExprExtractionConfig()])
         return a is not None and b is not None and verify(a, b)
     except Exception:
