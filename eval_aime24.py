@@ -45,7 +45,7 @@ def main():
     parser.add_argument("--lr", type=float, default=0.1, help="SLOT learning rate")
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "lbfgs"])
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max_tokens", type=int, default=2048)
+    parser.add_argument("--max_tokens", type=int, default=4096)
     args = parser.parse_args()
 
     # Set SLOT env vars
