@@ -10,6 +10,7 @@ Requires: trl>=0.16, vllm, math-verify, datasets, transformers
 import re
 from datasets import load_dataset
 from math_verify import parse, verify, ExprExtractionConfig
+from transformers import AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
 
 # ──────────────────────────── Config ────────────────────────────
@@ -96,16 +97,22 @@ training_args = GRPOConfig(
 
     # Logging
     logging_steps=1,
+    log_completions=True,
     save_steps=100,
     save_total_limit=3,
     report_to="wandb",
 )
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
 
 trainer = GRPOTrainer(
     model=MODEL_NAME,
     args=training_args,
     train_dataset=dataset,
     reward_funcs=[reward_format, reward_correctness],
+    processing_class=tokenizer,
 )
 
 trainer.train()
