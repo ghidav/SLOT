@@ -18,11 +18,8 @@ import re
 
 from datasets import load_dataset
 from math_verify import ExprExtractionConfig, parse, verify
+from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
-
-PROMPT_TEMPLATE = """Solve the following math problem efficiently and clearly. The last line of your response should be of the following format: 'Therefore, the final answer is: $\\boxed{{ANSWER}}$. I hope it is correct' (without quotes) where ANSWER is just the final number or expression that solves the problem. Think step by step before answering.
-
-{problem}"""
 
 
 def check_correct(text, ground_truth):
@@ -58,7 +55,16 @@ def main():
     dataset = load_dataset("HuggingFaceH4/aime_2024", split="train")
     problems = [{"problem": row["problem"], "answer": row["answer"]} for row in dataset]
 
-    prompts = [PROMPT_TEMPLATE.format(problem=p["problem"]) for p in problems]
+    # Use chat template (matches paper's --use-chat-template)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    prompts = []
+    for p in problems:
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": p["problem"]}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        prompts.append(prompt)
 
     print(f"Evaluating {len(problems)} AIME 2024 problems")
     print(f"Model: {args.model_path}")
