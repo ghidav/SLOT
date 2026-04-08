@@ -1879,10 +1879,25 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 max_ls = 10  # max line search evals
 
                 prev_grad = None
-                for k in range(chot_steps):
-                    loss, grad = _compute_loss_and_grad(self.ptuning_params)
+                prev_s = None
+                # Evaluate at initial point
+                loss, grad = _compute_loss_and_grad(self.ptuning_params)
 
-                    # Two-loop recursion to get search direction
+                for k in range(chot_steps):
+                    # 1. Update history using the step we just completed
+                    if prev_grad is not None and prev_s is not None:
+                        y_k = (grad - prev_grad).float()
+                        ys = torch.dot(y_k, prev_s)
+                        if ys > 1e-10:  # curvature condition
+                            if len(s_hist) >= m:
+                                s_hist.pop(0)
+                                y_hist.pop(0)
+                                rho_hist.pop(0)
+                            s_hist.append(prev_s)
+                            y_hist.append(y_k)
+                            rho_hist.append(1.0 / ys)
+
+                    # 2. Two-loop recursion to get search direction
                     q = grad.clone().float()
                     n_hist = len(s_hist)
                     alphas = [None] * n_hist
@@ -1906,7 +1921,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
 
                     direction = -r.to(self.ptuning_params.dtype)
 
-                    # Backtracking line search (Armijo condition)
+                    # 3. Backtracking line search (Armijo condition)
                     step_size = chot_lr
                     dir_dot_grad = torch.dot(direction.float(), grad.float())
                     if dir_dot_grad >= 0:
@@ -1914,31 +1929,26 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                         direction = -grad
                         dir_dot_grad = -torch.dot(grad.float(), grad.float())
 
+                    accepted_grad = None
                     for _ in range(max_ls):
                         new_params = self.ptuning_params + step_size * direction
-                        new_loss, _ = _compute_loss_and_grad(new_params)
+                        new_loss, new_grad = _compute_loss_and_grad(new_params)
                         if new_loss <= loss + c1 * step_size * dir_dot_grad:
+                            accepted_grad = new_grad
                             break
                         step_size *= 0.5
                     else:
                         new_params = self.ptuning_params + step_size * direction
+                        _, accepted_grad = _compute_loss_and_grad(new_params)
 
-                    # Update history
-                    s_k = (step_size * direction).float()
-                    if prev_grad is not None:
-                        y_k = (grad - prev_grad).float()
-                        ys = torch.dot(y_k, s_k)
-                        if ys > 1e-10:  # curvature condition
-                            if len(s_hist) >= m:
-                                s_hist.pop(0)
-                                y_hist.pop(0)
-                                rho_hist.pop(0)
-                            s_hist.append(s_k)
-                            y_hist.append(y_k)
-                            rho_hist.append(1.0 / ys)
-
+                    # 4. Save state for next iteration's history update
+                    prev_s = (new_params - self.ptuning_params).float()
                     prev_grad = grad.float()
                     self.ptuning_params = new_params
+
+                    # Reuse gradient from accepted line search step
+                    loss = new_loss
+                    grad = accepted_grad
 
             else:
                 # ── AdamW (original) ──
